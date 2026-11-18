@@ -13,7 +13,15 @@ use sha2::{Digest, Sha256};
 use crate::{api::cursor::proxy, Error, Result};
 
 pub const BOOTSTRAP_STATSIG_PATH: &str = "/aiserver.v1.AnalyticsService/BootstrapStatsig";
-const AGENT_RETRIES_GATE: &str = "nal_agent_retries";
+/// Statsig gates cursor-byok pins regardless of what Cursor's backend assigns.
+const GATE_OVERRIDES: [(&str, bool); 2] = [
+    // Lets the client retry transient agent stream failures.
+    ("nal_agent_retries", true),
+    // Cursor 3.31+ runs the agent loop in the client and only calls
+    // InferenceService/RunInferenceSSE for model output when this gate is on.
+    // cursor-byok implements the backend loop (AgentService/RunSSE), so keep it off.
+    ("agent_host_local_loop", false),
+];
 const LOCAL_RULE: &str = "local_enabled";
 
 #[derive(Clone, PartialEq, Message)]
@@ -51,7 +59,7 @@ fn patch_upstream(response: proxy::BufferedResponse) -> Result<Response<Body>> {
     let (framed, payload) = unary_payload(&response.body)?;
     let mut message = BootstrapStatsigResponse::decode(payload)?;
     let mut config = serde_json::from_str::<Value>(&message.config)?;
-    enable_agent_retries(&mut config)?;
+    apply_gate_overrides(&mut config)?;
     message.config = serde_json::to_string(&config)?;
     Ok(response.with_body(encode_unary(&message, framed)))
 }
@@ -74,7 +82,7 @@ fn local_response() -> Result<Response<Body>> {
         },
         "time": generated_at_ms
     });
-    enable_agent_retries(&mut config)?;
+    apply_gate_overrides(&mut config)?;
     let message = BootstrapStatsigResponse {
         config: serde_json::to_string(&config)?,
         generated_at_ms,
@@ -96,8 +104,8 @@ fn local_response() -> Result<Response<Body>> {
     Ok(response)
 }
 
-fn enable_agent_retries(config: &mut Value) -> Result<()> {
-    let gate_key = statsig_key(config, AGENT_RETRIES_GATE);
+fn apply_gate_overrides(config: &mut Value) -> Result<()> {
+    let keys = GATE_OVERRIDES.map(|(name, value)| (statsig_key(config, name), value));
     let root = config
         .as_object_mut()
         .ok_or_else(|| Error::Protocol("Statsig bootstrap config must be an object".into()))?;
@@ -106,7 +114,9 @@ fn enable_agent_retries(config: &mut Value) -> Result<()> {
         .or_insert_with(|| Value::Object(Map::new()))
         .as_object_mut()
         .ok_or_else(|| Error::Protocol("Statsig feature_gates must be an object".into()))?;
-    gates.insert(gate_key.clone(), enabled_gate(&gate_key));
+    for (key, value) in keys {
+        gates.insert(key.clone(), gate(&key, value));
+    }
     Ok(())
 }
 
@@ -127,10 +137,10 @@ fn djb2(value: &str) -> String {
         .to_string()
 }
 
-fn enabled_gate(name: &str) -> Value {
+fn gate(name: &str, value: bool) -> Value {
     json!({
         "name": name,
-        "value": true,
+        "value": value,
         "rule_id": LOCAL_RULE,
         "ruleID": LOCAL_RULE,
         "group_name": LOCAL_RULE,
@@ -173,4 +183,46 @@ fn encode_unary(message: &impl Message, framed: bool) -> Bytes {
     output.put_u32(payload.len() as u32);
     output.extend_from_slice(&payload);
     output.freeze()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gate_value(config: &Value, name: &str) -> Option<bool> {
+        config["feature_gates"][statsig_key(config, name)]["value"].as_bool()
+    }
+
+    #[test]
+    fn upstream_local_loop_gate_is_forced_off() {
+        for hash in ["none", "djb2", "sha256"] {
+            let mut config = json!({ "hash_used": hash, "feature_gates": {} });
+            let key = statsig_key(&config, "agent_host_local_loop");
+            config["feature_gates"][&key] = gate(&key, true);
+
+            apply_gate_overrides(&mut config).unwrap();
+
+            assert_eq!(
+                gate_value(&config, "agent_host_local_loop"),
+                Some(false),
+                "{hash}"
+            );
+            assert_eq!(
+                gate_value(&config, "nal_agent_retries"),
+                Some(true),
+                "{hash}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_bootstrap_keeps_backend_agent_loop() {
+        let response = local_response().unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let message = BootstrapStatsigResponse::decode(body.as_ref()).unwrap();
+        let config: Value = serde_json::from_str(&message.config).unwrap();
+        assert_eq!(gate_value(&config, "agent_host_local_loop"), Some(false));
+    }
 }

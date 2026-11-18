@@ -160,22 +160,24 @@ pub fn decode(request: &ai::BidiAppendRequest) -> Result<DecodedAppend> {
         .map(|id| id.request_id.as_str())
         .filter(|id| !id.is_empty())
         .ok_or_else(|| Error::Protocol("BidiAppend request_id is required".into()))?;
-    if !request.data_binary.is_empty() {
-        return Err(Error::Protocol(
-            "BidiAppend data_binary is not part of the captured protocol".into(),
-        ));
-    }
-    if request.data.is_empty() {
+    // Cursor 3.31+ sends the raw AgentClientMessage bytes in `data_binary`;
+    // older clients hex-encode the same bytes into `data`. A client sets one or the other.
+    let hex_payload;
+    let payload = if !request.data_binary.is_empty() {
+        request.data_binary.as_slice()
+    } else if !request.data.is_empty() {
+        hex_payload = hex::decode(&request.data)
+            .map_err(|error| Error::Protocol(format!("invalid BidiAppend hex: {error}")))?;
+        hex_payload.as_slice()
+    } else {
         return Err(Error::Protocol(
             "BidiAppend contains no AgentClientMessage".into(),
         ));
-    }
-    let payload = hex::decode(&request.data)
-        .map_err(|error| Error::Protocol(format!("invalid BidiAppend hex: {error}")))?;
+    };
     Ok(DecodedAppend {
         request_id: request_id.into(),
         seqno: request.append_seqno,
-        message: agent::AgentClientMessage::decode(payload.as_slice())?,
+        message: agent::AgentClientMessage::decode(payload)?,
     })
 }
 
@@ -208,4 +210,40 @@ pub async fn append(
         })
         .await?;
     Ok(ai::BidiAppendResponse {})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn append(data: String, data_binary: Vec<u8>) -> ai::BidiAppendRequest {
+        ai::BidiAppendRequest {
+            data,
+            request_id: Some(ai::BidiRequestId {
+                request_id: "request".into(),
+            }),
+            append_seqno: 3,
+            data_binary,
+        }
+    }
+
+    #[test]
+    fn binary_and_hex_payloads_decode_to_the_same_client_message() {
+        // KV SetBlobResult ack captured from Cursor.
+        let bytes = hex::decode("1a0408011a00").unwrap();
+        let binary = decode(&append(String::new(), bytes.clone())).unwrap();
+        let hex = decode(&append(hex::encode(&bytes), Vec::new())).unwrap();
+        assert_eq!(binary.message, hex.message);
+        assert_eq!(binary.seqno, 3);
+        assert!(matches!(
+            binary.message.message,
+            Some(agent::agent_client_message::Message::KvClientMessage(_))
+        ));
+    }
+
+    #[test]
+    fn empty_payload_is_rejected() {
+        let error = decode(&append(String::new(), Vec::new())).err().unwrap();
+        assert!(error.to_string().contains("no AgentClientMessage"));
+    }
 }
